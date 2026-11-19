@@ -12,6 +12,8 @@ A deterministic script does all the gathering. It keeps a continuous, append-onl
 ## Catching up
 
 1. Run `SYNC`. It prints one line: tickets in scope, how many new events it appended, and the output directory (by default `~/.jira-sync/sprint`). Pass `--full` only if the user asks for a rebuild. It never duplicates events.
+   - If it says the board has no active sprint, nothing was synced. Tell the user; the existing feed and snapshots are still readable.
+   - If the user asks about a different board, pass `--board ID --out ~/.jira-sync/board-ID` so each board keeps its own feed.
    - If it fails because config is missing, help the user create `~/.jira-sync/.env` from `env.example`. Never ask them to paste an API token into the chat; they should put it in the file themselves. They can also export the same `JIRA_*` variables in their environment.
 2. Read the slice of the feed that fits the question. Each command prints compact Markdown, one line per event, grouped by UTC day. None of them sync or hit the network.
    - `SYNC --new`: events ingested by the sync you just ran. This is the default for "what changed?"

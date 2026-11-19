@@ -308,6 +308,33 @@ class JiraClient:
                 if not issues or start >= data.get("total", 0):
                     return
 
+    def board_scope(self, board_id: str) -> tuple[str | None, str]:
+        """Board -> (JQL, label). JQL is None when a scrum board has no active sprint.
+
+        Scrum: issues matching the board's saved filter that are in its active sprint(s).
+        Kanban: the board's saved filter plus its sub-filter (which usually hides old done work).
+        """
+        agile = f"/rest/agile/1.0/board/{board_id}"
+        board = self.get(agile)
+        config = self.get(f"{agile}/configuration")
+        base = f"filter = {config['filter']['id']}"
+        label = f"board {board_id} ({board.get('name', '?')})"
+        if board.get("type") == "scrum":
+            sprints, start = [], 0
+            while True:
+                page = self.get(f"{agile}/sprint", {"state": "active", "startAt": start, "maxResults": 50})
+                batch = page.get("values", [])
+                sprints += batch
+                start += len(batch)
+                if not batch or page.get("isLast", True):
+                    break
+            if not sprints:
+                return None, label
+            ids = ", ".join(str(s["id"]) for s in sorted(sprints, key=lambda s: s["id"]))
+            return f"{base} AND sprint in ({ids})", label
+        sub = ((config.get("subQuery") or {}).get("query") or "").strip()
+        return (f"{base} AND ({sub})" if sub else base), label
+
     def issue(self, key: str, fields: list[str]) -> dict:
         issue = self.get(f"{self.api}/issue/{key}", {"fields": ",".join(fields), "expand": "changelog"})
         # Embedded comments and changelog are capped; page the rest in if needed.
@@ -587,7 +614,7 @@ def show(out: Path, since: str | None = None, keys=(), new: bool = False) -> str
     return render_events(events) if events else "No matching events."
 
 
-def render_sprint(index: dict, sprints: dict, jql: str, now_s: str) -> str:
+def render_sprint(index: dict, sprints: dict, jql: str, now_s: str, scope_label: str = "") -> str:
     in_use = {s for r in index.values() for s in r["sprints"]}
     active = sorted((s for n, s in sprints.items() if n in in_use and s["state"] == "active"),
                     key=lambda s: s["name"])
@@ -599,7 +626,7 @@ def render_sprint(index: dict, sprints: dict, jql: str, now_s: str) -> str:
             L.append(f"Goal: {s['goal']}")
     if not active:
         L.append("# Jira scope")
-    L.append(f"Synced {now_s} · JQL: `{jql}`")
+    L.append(f"Synced {now_s} · " + (f"{scope_label} · " if scope_label else "") + f"JQL: `{jql}`")
 
     def pts(keys):
         total = sum(index[k]["points"] or 0 for k in keys if isinstance(index[k]["points"], (int, float)))
@@ -640,7 +667,7 @@ def render_sprint(index: dict, sprints: dict, jql: str, now_s: str) -> str:
 # ----------------------------------------------------------------------- sync
 
 def sync(client, jql: str, out: Path, extra_names=(), full: bool = False, now: datetime | None = None,
-         workers: int = 6) -> dict:
+         workers: int = 6, scope_label: str = "") -> dict:
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     now = now or datetime.now(timezone.utc)
@@ -714,7 +741,7 @@ def sync(client, jql: str, out: Path, extra_names=(), full: bool = False, now: d
     span = f"{fmt_ts(min(feed, key=event_sort)['ts'])[:10]} → {fmt_ts(max(feed, key=event_sort)['ts'])[:10]}" if feed else ""
     write(out / "FEED.md", f"# Jira feed\n{len(feed)} events · {span} · times UTC, oldest first.\n\n"
                            + render_events(feed))
-    write(out / "SPRINT.md", render_sprint(index, sprints, jql, now_s))
+    write(out / "SPRINT.md", render_sprint(index, sprints, jql, now_s, scope_label))
 
     state = {"last_sync": now_s, "jql": jql, "fields": fm, "sprints": sprints, "seq_before_last_sync": seq_before,
              "tickets": {k: index[k] for k in sorted(index, key=key_sort)}}
@@ -729,8 +756,10 @@ def sync(client, jql: str, out: Path, extra_names=(), full: bool = False, now: d
 def main(argv=None) -> int:
     load_dotenv(SYNC_HOME / ".env")
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--jql", help="override JIRA_JQL")
-    ap.add_argument("--project", help="override JIRA_PROJECT (used to build the default JQL)")
+    scope = ap.add_argument_group("scope (a flag here overrides all JIRA_JQL / JIRA_BOARD_ID / JIRA_PROJECT settings)")
+    scope.add_argument("--board", metavar="ID", help="board id: its active sprint(s), or a kanban board's filter")
+    scope.add_argument("--jql", help="arbitrary JQL")
+    scope.add_argument("--project", metavar="KEY", help="project key: `project = KEY AND sprint in openSprints()`")
     ap.add_argument("--out", type=Path,
                     default=Path(os.environ.get("JIRA_SYNC_DIR") or SYNC_HOME / "sprint").expanduser())
     ap.add_argument("--full", action="store_true", help="re-fetch every ticket, not just changed ones")
@@ -755,15 +784,26 @@ def main(argv=None) -> int:
     if cloud and not email:
         ap.error("Jira Cloud needs JIRA_EMAIL alongside JIRA_API_TOKEN")
 
-    project = args.project or os.environ.get("JIRA_PROJECT")
-    jql = args.jql or os.environ.get("JIRA_JQL") or (
-        f'project = "{project}" AND sprint in openSprints()' if project else None)
-    if not jql:
-        ap.error("set JIRA_JQL or JIRA_PROJECT")
+    # Any scope flag beats every scope env var; among env vars, JQL > board > project.
+    if args.jql or args.board or args.project:
+        jql, board, project = args.jql, args.board, args.project
+    else:
+        jql, board, project = (os.environ.get(v) for v in ("JIRA_JQL", "JIRA_BOARD_ID", "JIRA_PROJECT"))
+    if not (jql or board or project):
+        ap.error("set a scope: JIRA_BOARD_ID, JIRA_JQL or JIRA_PROJECT (or --board / --jql / --project)")
     extra = [x.strip() for x in (os.environ.get("JIRA_EXTRA_FIELDS") or "").split(",") if x.strip()]
 
     client = JiraClient(base, token, email=email, cloud=cloud)
-    r = sync(client, jql, args.out, extra_names=extra, full=args.full)
+    label = ""
+    if not jql and board:
+        jql, label = client.board_scope(board.strip())
+        if jql is None:
+            # Syncing an empty scope would log every ticket as leaving; wait for the next sprint instead.
+            print(f"jira-sync: {label} has no active sprint; nothing synced, feed unchanged.")
+            return 0
+    elif not jql:
+        jql = f'project = "{project}" AND sprint in openSprints()'
+    r = sync(client, jql, args.out, extra_names=extra, full=args.full, scope_label=label)
     if r["first"]:
         print(f"jira-sync: initial sync, {r['total']} tickets, {r['new_events']} events backfilled → {args.out}")
     else:

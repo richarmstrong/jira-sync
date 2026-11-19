@@ -58,7 +58,13 @@ chmod 600 ~/.jira-sync/.env
 $EDITOR ~/.jira-sync/.env
 ```
 
-You'll need your Jira URL, your email, an [API token](https://id.atlassian.com/manage-profile/security/api-tokens), and either a project key or a JQL query. You can set the same `JIRA_*` variables as real environment variables instead, which is useful in cloud or CI environments. Environment variables take precedence over the file.
+You'll need your Jira URL, your email, an [API token](https://id.atlassian.com/manage-profile/security/api-tokens), and a scope. The scope is normally a board ID: the number in the board's URL, as in `.../boards/42`.
+
+Here's how each kind of scope behaves:
+
+- **Scrum board:** the tickets on the board (using its saved filter) that are in its active sprint or sprints. When a sprint rolls over, carried-over tickets stay in scope, finished ones leave, and the feed records both. Between sprints, when nothing is active, a sync does nothing; it doesn't record every ticket as leaving.
+- **Kanban board:** the board's saved filter plus its own sub-filter, which usually hides old finished work.
+- **Alternatives:** you can use `JIRA_JQL` or `JIRA_PROJECT` instead of a board. You can set the same `JIRA_*` variables as real environment variables instead, which is useful in cloud or CI environments. Environment variables take precedence over the file.
 
 Now ask Claude to "sync jira and catch me up on the sprint."
 
@@ -69,7 +75,7 @@ python3 skills/jira-sprint/jira_sync.py           # incremental sync
 python3 skills/jira-sprint/jira_sync.py --full    # re-fetch every ticket
 ```
 
-Other flags: `--jql` and `--project` override the config, and `--out DIR` changes where the files go. Set `JIRA_SYNC_HOME` to move the whole `~/.jira-sync` directory.
+Other flags: `--board ID`, `--jql`, and `--project` override whatever scope the config sets. `--out DIR` changes where the files go. If you track more than one board, give each one its own `--out` directory, so their feeds stay separate. Set `JIRA_SYNC_HOME` to move the whole `~/.jira-sync` directory.
 
 The script supports Jira Cloud (REST v3) and Server/Data Center (REST v2, with a personal access token and `JIRA_DEPLOYMENT=server`). It needs Python 3.9 or later.
 

@@ -1,8 +1,12 @@
 """End-to-end tests against a fake Jira client. Run: python3 -m unittest discover tests"""
 import copy
+import io
+import os
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -193,6 +197,72 @@ class AdfTest(unittest.TestCase):
                                      "state=ACTIVE,name=Sprint 9,startDate=2026-11-01T00:00:00.000Z,"
                                      "endDate=<null>,goal=<null>]"])
         self.assertEqual(s, [{"name": "Sprint 9", "state": "active", "start": "2026-11-01", "end": "", "goal": ""}])
+
+
+class BoardClient(jira_sync.JiraClient):
+    """Real board_scope logic over canned Agile API responses."""
+
+    def __init__(self, board_type="scrum", sprints=(), sub_query=None):
+        super().__init__("https://x.atlassian.net", "token", email="me@example.com")
+        config = {"filter": {"id": 100}}
+        if sub_query:
+            config["subQuery"] = {"query": sub_query}
+        self.routes = {
+            "/rest/agile/1.0/board/42": {"id": 42, "name": "Payments", "type": board_type},
+            "/rest/agile/1.0/board/42/configuration": config,
+            "/rest/agile/1.0/board/42/sprint": {"values": [{"id": i} for i in sprints], "isLast": True},
+        }
+        self.calls = []
+
+    def get(self, path, params=None):
+        self.calls.append((path, params))
+        return self.routes[path]
+
+
+class BoardScopeTest(unittest.TestCase):
+    def test_scrum_uses_board_filter_and_active_sprints(self):
+        c = BoardClient(sprints=[9, 7])
+        self.assertEqual(c.board_scope("42"), ("filter = 100 AND sprint in (7, 9)", "board 42 (Payments)"))
+        self.assertEqual(c.calls[-1][1]["state"], "active")
+
+    def test_scrum_without_active_sprint(self):
+        self.assertEqual(BoardClient().board_scope("42"), (None, "board 42 (Payments)"))
+
+    def test_kanban_uses_filter_and_subquery(self):
+        jql, _ = BoardClient("kanban", sub_query="fixVersion is EMPTY").board_scope("42")
+        self.assertEqual(jql, "filter = 100 AND (fixVersion is EMPTY)")
+        self.assertEqual(BoardClient("kanban").board_scope("42")[0], "filter = 100")
+
+
+class MainScopeTest(unittest.TestCase):
+    ENV = {"JIRA_BASE_URL": "https://x.atlassian.net", "JIRA_API_TOKEN": "t", "JIRA_EMAIL": "me@example.com",
+           "JIRA_JQL": "project = ENV", "JIRA_BOARD_ID": "", "JIRA_PROJECT": "", "JIRA_EXTRA_FIELDS": ""}
+
+    def run_main(self, argv, sprints=(7,)):
+        seen = {}
+
+        def fake_sync(client, jql, out, **kw):
+            seen["jql"], seen["label"] = jql, kw.get("scope_label")
+            return {"first": True, "total": 0, "new_events": 0}
+
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, self.ENV), \
+                mock.patch.object(jira_sync, "JiraClient", lambda *a, **k: BoardClient(sprints=sprints)), \
+                mock.patch.object(jira_sync, "sync", fake_sync), redirect_stdout(out):
+            jira_sync.main(argv + ["--out", tempfile.gettempdir()])
+        return seen, out.getvalue()
+
+    def test_board_flag_beats_env_jql(self):
+        seen, _ = self.run_main(["--board", "42"])
+        self.assertEqual(seen, {"jql": "filter = 100 AND sprint in (7)", "label": "board 42 (Payments)"})
+
+    def test_env_jql_used_without_flags(self):
+        self.assertEqual(self.run_main([])[0]["jql"], "project = ENV")
+
+    def test_no_active_sprint_skips_sync(self):
+        seen, printed = self.run_main(["--board", "42"], sprints=())
+        self.assertEqual(seen, {})
+        self.assertIn("no active sprint; nothing synced", printed)
 
 
 if __name__ == "__main__":
