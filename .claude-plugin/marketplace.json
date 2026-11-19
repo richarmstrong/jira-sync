@@ -1,0 +1,15 @@
+{
+  "name": "jira-sync",
+  "description": "A lean, dependency-free Jira sprint sync for Claude Code.",
+  "owner": {
+    "name": "Rich Armstrong",
+    "url": "https://github.com/richarmstrong"
+  },
+  "plugins": [
+    {
+      "name": "jira-sync",
+      "source": "./",
+      "description": "Sync a Jira sprint into small Markdown files so Claude can catch up on what changed cheaply."
+    }
+  ]
+}
