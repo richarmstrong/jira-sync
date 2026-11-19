@@ -1,6 +1,6 @@
 # jira-sync
 
-A Claude Code plugin that mirrors your current Jira sprint into small Markdown files, so Claude can catch up on what changed without burning tokens on gathering and organizing.
+A Claude Code plugin that turns your Jira sprint into a continuous feed of changes, like RSS for your tickets, plus small Markdown snapshots. Claude can catch up on what changed without burning tokens on gathering and organizing.
 
 ## Why not the Atlassian MCP server?
 
@@ -14,19 +14,31 @@ Each sync:
 
 1. Runs one search that returns only the `updated` timestamp of every ticket in scope.
 2. Fetches full detail only for tickets that are new or whose timestamp moved since the last sync.
-3. Writes a delta feed from Jira's changelog and comments, covering only what happened since the last sync.
+3. Turns each fetched ticket's changelog and comments into events, and appends any it hasn't seen before to the feed.
+
+The feed is append-only. Nothing is ever pruned or rewritten. The first time a ticket is fetched, its whole Jira history is backfilled. Events have stable IDs taken from Jira's own IDs, so re-syncing, even with `--full`, never duplicates anything.
 
 Output goes to `~/.jira-sync/sprint/`:
 
 | file | what |
 | --- | --- |
-| `CHANGES.md` | delta since the last sync: added, removed, and changed tickets, with lines like `2026-11-19 08:00 Ana: status: To Do → In Progress` |
-| `SPRINT.md` | sprint header, points by status, one line per ticket, blockers |
-| `tickets/KEY.md` | full ticket: fields, links, subtasks, description, comments |
-| `history/` | every non-empty `CHANGES.md`, archived |
-| `archive/` | tickets that dropped out of scope |
+| `feed.jsonl` | **the stream**: one JSON event per line (field change, comment, comment edit, creation, entering or leaving scope) |
+| `FEED.md` | the whole stream rendered, one line per event, like `08:00 SHOP-10 Ana: status: To Do → In Progress` |
+| `SPRINT.md` | current snapshot: sprint header, points by status, one line per ticket, blockers |
+| `tickets/KEY.md` | current snapshot of a ticket: fields, links, subtasks, description, comments |
+| `archive/` | last snapshot of tickets that dropped out of scope |
 
-The script itself prints one line, so running it costs Claude almost nothing. The bundled skill tells Claude to read `CHANGES.md` first and to open individual ticket files only when it needs them.
+Read any slice of the stream without syncing:
+
+```sh
+jira_sync.py --new                  # events ingested by the latest sync
+jira_sync.py --since 2026-11-18     # everything that happened since a date (UTC)
+jira_sync.py --key SHOP-10          # one ticket's whole history (repeatable)
+```
+
+A sync prints one line, so running it costs Claude almost nothing. The bundled skill tells Claude to read only the slice of the feed it needs, and to open ticket files only when it needs detail.
+
+Because `feed.jsonl` records every Status, Story Points, Sprint, and Assignee change with timestamps, it holds everything needed for burnup charts and timelines.
 
 ## Install
 

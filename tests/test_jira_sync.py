@@ -94,7 +94,8 @@ class SyncTest(unittest.TestCase):
                            now=datetime(2026, 11, 18, 10, tzinfo=timezone.utc))
         self.assertTrue(r["first"])
         self.assertEqual(sorted(jira.fetched), ["SHOP-10", "SHOP-11", "SHOP-12"])
-        self.assertIn("Initial sync — 3 tickets", self.read("CHANGES.md"))
+        self.assertEqual(r["new_events"], 3)  # one "created" per ticket
+        self.assertIn("- 10:00 SHOP-11 Bo: created: Receipts", self.read("FEED.md"))
         sprint = self.read("SPRINT.md")
         self.assertIn("# Sprint 42 (2026-11-10 → 2026-11-24)", sprint)
         self.assertIn("Goal: Ship checkout v2", sprint)
@@ -129,25 +130,52 @@ class SyncTest(unittest.TestCase):
                            now=datetime(2026, 11, 19, 9, tzinfo=timezone.utc))
         self.assertEqual(sorted(jira.fetched), ["SHOP-10", "SHOP-13"])
         self.assertEqual((r["added"], r["changed"], r["removed"]), (1, 1, 1))
-        changes = self.read("CHANGES.md")
-        self.assertIn("1 added · 1 changed · 1 removed · 3 in scope", changes)
-        self.assertIn("- SHOP-13 [To Do] Story · unassigned · Refunds", changes)
-        self.assertIn("- SHOP-12 [last: To Do] API keys", changes)
-        self.assertIn("2026-11-19 08:00 Ana: status: To Do → In Progress", changes)
-        self.assertIn("Ana: description edited", changes)
-        self.assertIn("Bo commented: Keys are in the vault now.", changes)
-        self.assertNotIn("Old", changes)  # pre-dates the previous sync
+        # SHOP-10: old summary edit (backfilled) + status + description + comment;
+        # SHOP-13: created + entered scope; SHOP-12: left scope.
+        self.assertEqual(r["new_events"], 7)
+        self.assertEqual(r["feed_events"], 10)
+        new = jira_sync.show(self.out, new=True)
+        self.assertIn("## 2026-11-17\n- 08:00 SHOP-10 Old: summary: x → y", new)  # history is never filtered out
+        self.assertIn("- 08:00 SHOP-10 Ana: status: To Do → In Progress", new)
+        self.assertIn("- 08:00 SHOP-10 Ana: description edited", new)
+        self.assertIn("- 08:05 SHOP-10 Bo: commented: Keys are in the vault now.", new)
+        self.assertIn("SHOP-13 Bo: created: Refunds", new)
+        self.assertIn("- 09:00 SHOP-12 jira-sync: left sync scope", new)
+        self.assertIn("- 09:00 SHOP-13 jira-sync: entered sync scope", new)
+        self.assertNotIn("SHOP-11", new)  # ingested by the earlier sync
+        feed_md = self.read("FEED.md")
+        self.assertIn("10 events · 2026-11-01 → 2026-11-19", feed_md)
+        self.assertIn("SHOP-11 Bo: created: Receipts", feed_md)  # earlier syncs' events are kept
+        since = jira_sync.show(self.out, since="2026-11-19")
+        self.assertNotIn("Old", since)
+        self.assertNotIn("created", since)
+        one = jira_sync.show(self.out, keys=["shop-10"])
+        self.assertEqual({ln.split()[2] for ln in one.splitlines() if ln.startswith("- ")}, {"SHOP-10"})
         self.assertTrue((self.out / "archive/SHOP-12.md").exists())
         self.assertFalse((self.out / "tickets/SHOP-12.md").exists())
-        self.assertEqual(len(list((self.out / "history").iterdir())), 2)
 
-        # 3. nothing changed -> nothing fetched, no new history entry
+        # 3. nothing changed -> nothing fetched, nothing appended
         jira.fetched.clear()
         r = jira_sync.sync(jira, "sprint in openSprints()", self.out,
                            now=datetime(2026, 11, 19, 10, tzinfo=timezone.utc))
         self.assertEqual(jira.fetched, [])
-        self.assertIn("# No changes", self.read("CHANGES.md"))
-        self.assertEqual(len(list((self.out / "history").iterdir())), 2)
+        self.assertEqual(r["new_events"], 0)
+        self.assertEqual(jira_sync.show(self.out, new=True), "No matching events.")
+
+        # 4. touched with no changelog detail (e.g. attachment) -> one "updated" event
+        jira.issues["SHOP-11"]["fields"]["updated"] = "2026-11-19T10:30:00.000+0000"
+        r = jira_sync.sync(jira, "sprint in openSprints()", self.out,
+                           now=datetime(2026, 11, 19, 11, tzinfo=timezone.utc))
+        self.assertEqual(r["new_events"], 1)
+        self.assertIn("- 10:30 SHOP-11: updated (no changelog detail", jira_sync.show(self.out, new=True))
+
+        # 5. --full re-derives everything but appends nothing twice
+        r = jira_sync.sync(jira, "sprint in openSprints()", self.out, full=True,
+                           now=datetime(2026, 11, 19, 12, tzinfo=timezone.utc))
+        self.assertEqual(r["new_events"], 0)
+        self.assertEqual(len(self.read("feed.jsonl").splitlines()), 11)
+        seqs = [jira_sync.json.loads(ln)["seq"] for ln in self.read("feed.jsonl").splitlines()]
+        self.assertEqual(seqs, list(range(1, 12)))
 
 
 class AdfTest(unittest.TestCase):

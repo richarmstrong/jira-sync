@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
-"""Incrementally mirror a Jira sprint into token-cheap Markdown.
+"""Incrementally mirror a Jira sprint into a continuous change feed plus Markdown snapshots.
 
-Each run:
+Each sync:
   1. Runs a cheap search (only the `updated` field) for every ticket in scope.
   2. Re-fetches full detail only for tickets that are new or whose `updated`
      stamp moved since the last run.
-  3. Writes a delta "feed" from the changelog and comments made since the last sync.
+  3. Appends every not-yet-seen event (field changes, comments, comment edits,
+     creation, scope moves) to an append-only feed.  A ticket's whole history is
+     backfilled the first time it is fetched; nothing is ever dropped.
 
 Output directory (default: ~/.jira-sync/sprint):
-  CHANGES.md       what changed since the previous sync  <- read this first
-  SPRINT.md        one-line-per-ticket index of everything in scope
-  tickets/KEY.md   full ticket: fields, links, description, comments
-  history/*.md     every non-empty CHANGES.md, archived by sync time
-  archive/KEY.md   tickets that have dropped out of scope
+  feed.jsonl       the stream: one JSON event per line, append-only
+  FEED.md          the whole stream rendered, one line per event, by day
+  SPRINT.md        current snapshot: one line per ticket in scope
+  tickets/KEY.md   current snapshot of a ticket: fields, links, description, comments
+  archive/KEY.md   last snapshot of tickets that have dropped out of scope
   state.json       bookkeeping (per-ticket `updated` stamps, field ids)
+
+Read slices of the feed without syncing:
+  jira_sync.py --new                 events ingested by the latest sync
+  jira_sync.py --since 2026-11-18    events that happened since a date
+  jira_sync.py --key ABC-123         one ticket's whole history
 
 Stdlib only, Python 3.9+.  Config comes from env vars, then ~/.jira-sync/.env
 (see env.example).  Set JIRA_SYNC_HOME to move that directory.
@@ -83,8 +90,13 @@ def parse_ts(s: str) -> datetime:
 
 
 def fmt_ts(s: str | None) -> str:
-    """'2026-11-18T14:02:11.000+0000' -> '2026-11-18 14:02' (Jira's own offset)."""
-    return s[:16].replace("T", " ") if s else ""
+    """'2026-11-18T14:02:11.000-0500' -> '2026-11-18 19:02' (UTC, so every view agrees)."""
+    if not s:
+        return ""
+    try:
+        return parse_ts(s).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return s[:16].replace("T", " ")
 
 
 def fmt_num(v) -> str:
@@ -400,6 +412,7 @@ def normalize(issue: dict, fm: dict) -> dict:
         subtasks.append({"key": st["key"], "summary": sf.get("summary", ""), "status": nm(sf.get("status"))})
 
     comments = [{
+        "id": str(c.get("id") or c.get("created", "")),
         "author": nm(c.get("author"), "displayName") or "?",
         "created": c.get("created", ""),
         "updated": c.get("updated") or c.get("created", ""),
@@ -480,51 +493,98 @@ def render_ticket(t: dict) -> str:
     return "\n".join(L)
 
 
-def describe_changes(issue: dict, t: dict, since: datetime) -> list[str]:
-    events = []
+# ----------------------------------------------------------------------- feed
+#
+# feed.jsonl is an append-only stream: one JSON event per line, never rewritten
+# or pruned.  Event ids are stable (derived from Jira's own ids), so re-deriving
+# a ticket's events and appending only unseen ids is idempotent, and a ticket's
+# full history is backfilled the first time it is fetched.
+#
+# Event fields: id, seq (ingestion order), synced (when ingested), ts (when it
+# happened in Jira), key, kind, author, plus field/from/to (kind=field) or text.
+# kinds: created | field | comment | comment_edit | updated | scope
+
+def issue_events(issue: dict, t: dict) -> list[dict]:
+    """Every event Jira can tell us about this ticket."""
+    key = t["key"]
+    ev = []
+    if t["created"]:
+        ev.append({"id": f"{key}#created", "ts": t["created"], "key": key, "kind": "created",
+                   "author": t["reporter"], "text": t["summary"]})
     for h in (issue.get("changelog") or {}).get("histories", []):
-        when = parse_ts(h["created"])
-        if when <= since:
-            continue
         who = nm(h.get("author"), "displayName") or "?"
-        for it in h.get("items", []):
-            field = it.get("field", "?")
-            fr, to = it.get("fromString") or "", it.get("toString") or ""
-            if field.lower() in LONG_TEXT_FIELDS or len(fr) > 80 or len(to) > 80:
-                desc = f"{field} edited"
-            else:
-                desc = f"{field}: {one_line(fr) or '∅'} → {one_line(to) or '∅'}"
-            events.append((when, f"{fmt_ts(h['created'])} {who}: {desc}"))
+        hid = h.get("id") or h["created"]
+        for i, it in enumerate(h.get("items", [])):
+            ev.append({"id": f"{key}#h{hid}.{i}", "ts": h["created"], "key": key, "kind": "field",
+                       "author": who, "field": it.get("field", "?"),
+                       "from": it.get("fromString") or "", "to": it.get("toString") or ""})
     for c in t["comments"]:
-        created, updated = parse_ts(c["created"]), parse_ts(c["updated"])
-        if created > since:
-            events.append((created, f"{fmt_ts(c['created'])} {c['author']} commented: {one_line(c['body'])}"))
-        elif updated > since:
-            events.append((updated, f"{fmt_ts(c['updated'])} {c['author']} edited a comment: {one_line(c['body'])}"))
-    events.sort(key=lambda e: e[0])
-    return [e[1] for e in events] or ["updated (no field-level detail: attachment, worklog, or similar)"]
+        ev.append({"id": f"{key}#c{c['id']}", "ts": c["created"], "key": key, "kind": "comment",
+                   "author": c["author"], "text": c["body"]})
+        if c["updated"] != c["created"]:
+            ev.append({"id": f"{key}#c{c['id']}@{c['updated']}", "ts": c["updated"], "key": key,
+                       "kind": "comment_edit", "author": c["author"], "text": c["body"]})
+    return ev
 
 
-def render_changes(now_s, prev_sync, total, added, removed, changed, index, prev_index) -> str:
-    def brief(k, r):
-        who = f"@{r['assignee']}" if r["assignee"] else "unassigned"
-        return f"{k} [{r['status']}] {r['type']} · {who} · {r['summary']}"
+def event_sort(e: dict):
+    return (parse_ts(e["ts"]), key_sort(e["key"]), e["id"])
 
-    if not (added or removed or changed):
-        return f"# No changes\nNothing changed between {prev_sync} and {now_s}. {total} tickets in scope."
-    L = [f"# Jira changes {prev_sync} → {now_s}",
-         f"{len(added)} added · {len(changed)} changed · {len(removed)} removed · {total} in scope"]
-    if added:
-        L += ["", f"## Added to scope ({len(added)})"] + [f"- {brief(k, index[k])}" for k in added]
-    if removed:
-        L += ["", f"## Removed from scope ({len(removed)})"]
-        L += [f"- {k} [last: {prev_index[k]['status']}] {prev_index[k]['summary']} (file → archive/)" for k in removed]
-    if changed:
-        L += ["", f"## Changed ({len(changed)})"]
-        for k, lines in changed:
-            r = index[k]
-            L += ["", f"### {k} [{r['status']}] {r['summary']}"] + [f"- {ln}" for ln in lines]
-    return "\n".join(L)
+
+def describe_event(e: dict) -> str:
+    kind = e["kind"]
+    if kind == "field":
+        field, fr, to = e["field"], e["from"], e["to"]
+        if field.lower() in LONG_TEXT_FIELDS or len(fr) > 80 or len(to) > 80:
+            return f"{field} edited"
+        return f"{field}: {one_line(fr) or '∅'} → {one_line(to) or '∅'}"
+    if kind == "comment":
+        return f"commented: {one_line(e['text'])}"
+    if kind == "comment_edit":
+        return f"edited a comment: {one_line(e['text'])}"
+    if kind == "created":
+        return f"created: {one_line(e['text'])}"
+    return e.get("text") or kind
+
+
+def render_events(events: list[dict]) -> str:
+    """Chronological (by when it happened in Jira), grouped by UTC day, one line per event."""
+    L, day = [], None
+    for e in sorted(events, key=event_sort):
+        stamp = fmt_ts(e["ts"])
+        if stamp[:10] != day:
+            day = stamp[:10]
+            L += ["", f"## {day}"]
+        who = f" {e['author']}" if e.get("author") else ""
+        L.append(f"- {stamp[11:]} {e['key']}{who}: {describe_event(e)}")
+    return "\n".join(L).lstrip()
+
+
+def load_feed(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def parse_since(s: str) -> datetime:
+    dt = datetime.fromisoformat(s.strip().replace("Z", "+00:00"))
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def show(out: Path, since: str | None = None, keys=(), new: bool = False) -> str:
+    """Filter the feed without touching the network."""
+    events = load_feed(Path(out) / "feed.jsonl")
+    if new:
+        state_path = Path(out) / "state.json"
+        floor = json.loads(state_path.read_text()).get("seq_before_last_sync", 0) if state_path.exists() else 0
+        events = [e for e in events if e["seq"] > floor]
+    if since:
+        cutoff = parse_since(since)
+        events = [e for e in events if parse_ts(e["ts"]) >= cutoff]
+    if keys:
+        wanted = {k.upper() for k in keys}
+        events = [e for e in events if e["key"] in wanted]
+    return render_events(events) if events else "No matching events."
 
 
 def render_sprint(index: dict, sprints: dict, jql: str, now_s: str) -> str:
@@ -582,12 +642,18 @@ def render_sprint(index: dict, sprints: dict, jql: str, now_s: str) -> str:
 def sync(client, jql: str, out: Path, extra_names=(), full: bool = False, now: datetime | None = None,
          workers: int = 6) -> dict:
     out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
     now = now or datetime.now(timezone.utc)
     now_s = now.strftime("%Y-%m-%d %H:%M UTC")
-    state_path = out / "state.json"
+    stamp = now.strftime("%Y-%m-%dT%H:%M:%S.000+0000")
+    state_path, feed_path = out / "state.json", out / "feed.jsonl"
     state = json.loads(state_path.read_text()) if state_path.exists() else {}
     prev_index: dict = state.get("tickets", {})
     first = not state
+    feed = load_feed(feed_path)
+    seen = {e["id"] for e in feed}
+    if state and not feed:
+        full = True  # state without a feed (older version): backfill every ticket's history
 
     fm = state.get("fields")
     if full or not fm or fm.get("extra_names") != sorted(extra_names):
@@ -606,10 +672,14 @@ def sync(client, jql: str, out: Path, extra_names=(), full: bool = False, now: d
 
     index = {k: v for k, v in prev_index.items() if k in current}
     sprints = state.get("sprints", {})
-    normalized = {}
+    new_events = []
     for k, issue in issues.items():
         t = normalize(issue, fm)
-        normalized[k] = t
+        events = [e for e in issue_events(issue, t) if e["id"] not in seen]
+        if k in changed and not events:
+            events = [{"id": f"{k}#updated@{t['updated']}", "ts": t["updated"], "key": k, "kind": "updated",
+                       "author": "", "text": "updated (no changelog detail: attachment, worklog, or similar)"}]
+        new_events += events
         index[k] = index_record(t)
         for s in t["sprints"]:
             sprints[s["name"]] = s
@@ -623,27 +693,37 @@ def sync(client, jql: str, out: Path, extra_names=(), full: bool = False, now: d
     in_use = {s for r in index.values() for s in r["sprints"]}
     sprints = {n: s for n, s in sprints.items() if n in in_use}
 
-    if first:
-        changes = (f"# Initial sync — {len(index)} tickets\nSynced {now_s}. Nothing to diff against yet; "
-                   "read SPRINT.md for the full picture.")
-    else:
-        details = [(k, describe_changes(issues[k], normalized[k], parse_ts(prev_index[k]["updated"])))
-                   for k in changed]
-        changes = render_changes(now_s, state.get("last_sync", "?"), len(index), added, removed, details,
-                                 index, prev_index)
-    write(out / "CHANGES.md", changes)
-    if first or added or removed or changed:
-        write(out / "history" / f"{now.strftime('%Y%m%dT%H%M%SZ')}.md", changes)
+    if not first:  # scope moves are observed by the sync itself, so they're stamped with sync time
+        for k in added:
+            new_events.append({"id": f"{k}#scope+@{stamp}", "ts": stamp, "key": k, "kind": "scope",
+                               "author": "jira-sync", "text": "entered sync scope"})
+        for k in removed:
+            new_events.append({"id": f"{k}#scope-@{stamp}", "ts": stamp, "key": k, "kind": "scope",
+                               "author": "jira-sync", "text": "left sync scope (ticket file moved to archive/)"})
+
+    seq_before = feed[-1]["seq"] if feed else 0
+    new_events.sort(key=event_sort)
+    for i, e in enumerate(new_events, seq_before + 1):
+        e["seq"], e["synced"] = i, stamp
+    if new_events:
+        with feed_path.open("a", encoding="utf-8") as fh:
+            for e in new_events:
+                fh.write(json.dumps(e, sort_keys=True, ensure_ascii=False) + "\n")
+    feed += new_events
+
+    span = f"{fmt_ts(min(feed, key=event_sort)['ts'])[:10]} → {fmt_ts(max(feed, key=event_sort)['ts'])[:10]}" if feed else ""
+    write(out / "FEED.md", f"# Jira feed\n{len(feed)} events · {span} · times UTC, oldest first.\n\n"
+                           + render_events(feed))
     write(out / "SPRINT.md", render_sprint(index, sprints, jql, now_s))
 
-    state = {"last_sync": now_s, "jql": jql, "fields": fm, "sprints": sprints,
+    state = {"last_sync": now_s, "jql": jql, "fields": fm, "sprints": sprints, "seq_before_last_sync": seq_before,
              "tickets": {k: index[k] for k in sorted(index, key=key_sort)}}
     tmp = state_path.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=1, sort_keys=True))
     tmp.replace(state_path)
 
     return {"total": len(index), "added": len(added), "changed": len(changed), "removed": len(removed),
-            "fetched": len(to_fetch), "first": first}
+            "fetched": len(to_fetch), "first": first, "new_events": len(new_events), "feed_events": len(feed)}
 
 
 def main(argv=None) -> int:
@@ -654,7 +734,15 @@ def main(argv=None) -> int:
     ap.add_argument("--out", type=Path,
                     default=Path(os.environ.get("JIRA_SYNC_DIR") or SYNC_HOME / "sprint").expanduser())
     ap.add_argument("--full", action="store_true", help="re-fetch every ticket, not just changed ones")
+    view = ap.add_argument_group("reading the feed (no sync, no network)")
+    view.add_argument("--show", action="store_true", help="print feed events as Markdown instead of syncing")
+    view.add_argument("--since", metavar="WHEN", help="only events at/after WHEN (e.g. 2026-11-18 or 2026-11-18T09:00; UTC unless offset given)")
+    view.add_argument("--key", action="append", default=[], metavar="KEY", help="only this ticket (repeatable)")
+    view.add_argument("--new", action="store_true", help="only events ingested by the most recent sync")
     args = ap.parse_args(argv)
+    if args.show or args.since or args.key or args.new:
+        print(show(args.out, since=args.since, keys=args.key, new=args.new))
+        return 0
 
     base = os.environ.get("JIRA_BASE_URL")
     token = os.environ.get("JIRA_API_TOKEN")
@@ -677,10 +765,10 @@ def main(argv=None) -> int:
     client = JiraClient(base, token, email=email, cloud=cloud)
     r = sync(client, jql, args.out, extra_names=extra, full=args.full)
     if r["first"]:
-        print(f"jira-sync: initial sync, {r['total']} tickets → {args.out}/SPRINT.md")
+        print(f"jira-sync: initial sync, {r['total']} tickets, {r['new_events']} events backfilled → {args.out}")
     else:
         print(f"jira-sync: {r['total']} in scope · {r['added']} added · {r['changed']} changed · "
-              f"{r['removed']} removed · {r['fetched']} fetched → {args.out}/CHANGES.md")
+              f"{r['removed']} removed · {r['new_events']} new events ({r['feed_events']} in feed) → {args.out}")
     return 0
 
 

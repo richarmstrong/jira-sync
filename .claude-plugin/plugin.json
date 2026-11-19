@@ -1,6 +1,6 @@
 {
   "name": "jira-sync",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Sync a Jira sprint into small Markdown files with a deterministic, dependency-free Python script, so Claude can catch up on what changed without burning tokens on gathering.",
   "author": {
     "name": "Rich Armstrong",
